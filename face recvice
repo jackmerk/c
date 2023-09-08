@@ -1,0 +1,1117 @@
+static float face_benchmark[5][2] = {
+  {38.2946f, 51.6963f},
+  {73.5318f, 51.5014f},
+  {56.0252f, 71.7366f},
+  {41.5493f, 92.3655f},
+  {70.7299f, 92.2041f}};
+static float face_benchmark_mean[2] = {56.0262f, 71.9008f};
+static float fd_s[6] = {0.05810196f, 0.04384749f, 0.04218817f, 0.04665449f, 0.07427644f, 0.09057835f};
+ 
+static std::string class_embedding[] = {"1_blue50","1_normal50_mixed2pic","1_normal50_sit",
+                                        "1_normal50_stand","2_blue100","2_normal_2","2_normal_2_mixed2pic"};
+void FaceRegistDriver::get_files_list(std::string dataset_dir_path)
+{
+  struct dirent *ptr;
+  DIR *dir;
+ 
+  std::string PATH;
+  PATH = dataset_dir_ + dataset_dir_path + "/";
+  dir = opendir(PATH.c_str());
+  while((ptr=readdir(dir)) != nullptr)
+  {
+    if(ptr->d_name[0] == '.')
+    {
+      continue;
+    }
+    if(ptr->d_type == DT_REG)
+    {
+      MulDir Tmep;
+      Tmep.SubDir = dataset_dir_path + "/";
+      Tmep.FileName = ptr->d_name;
+      files_list.push_back(Tmep);
+    }
+  }
+  closedir(dir);
+ 
+}
+ 
+bool FaceRegistDriver::get_files_list(std::vector<std::string> &subDir)
+{
+  struct dirent *ptr;
+  DIR *dir;
+  std::string PATH = dataset_dir_;
+  dir = opendir(PATH.c_str());
+  while((ptr=readdir(dir)) != nullptr)
+  {
+    if(ptr->d_name[0] == '.')
+      continue;
+    subDir.push_back(ptr->d_name);
+  }
+  for(auto iter : subDir)
+  {
+    printf("%s\n", iter.c_str());
+  }
+  closedir(dir);
+  if(subDir.size() == dataset_size)
+  {
+    return true;
+  }
+  else {
+    printf("[FaceRegistDriver] : Error to search dataset %ld \n", subDir.size());
+    return false;
+  }
+}
+ 
+void FaceRegistDriver::initialize(const std::string name)
+{
+  plugin_name = name;
+  input_cfg.steps = {16, 32};
+  input_cfg.image_size = {352, 480};
+  std::vector<int> min_size_0 = {16, 32};
+  std::vector<int> min_size_1 = {64, 128};
+  input_cfg.min_sizes.push_back(min_size_0);
+  input_cfg.min_sizes.push_back(min_size_1);
+  input_cfg.variance = {0.1f, 0.2f};
+  input_cfg.top_k = 5000;
+  input_cfg.nms_threshold = 0.4f;
+  input_cfg.draw_threshold = 0.4f;
+  generate_priorbox(input_cfg);
+ 
+  tta_ = false;
+  dist_threshold = 1.0f;
+ 
+  for (int i = 0; i < 4; i++)
+  {
+    FILE *fp = fopen((pkg_path + "/test_faces/embedding/" + std::to_string(i) + ".bin").c_str(), "rb");
+    float *target = (float *)calloc(512, sizeof(float));
+    fread(target, sizeof(float), 512, fp);
+    target_embs.push_back(target);
+    fclose(fp);
+  }
+ 
+  init_fpga();
+  init_zmq();
+  go_out = true;
+ 
+  ROS_INFO("[FaceRegistDriver] initialize..");
+}
+ 
+void FaceRegistDriver::init_fpga()
+{
+  memset(&faceD_output, 0, sizeof(struct Model_Output));
+ 
+  faceD_output.addr[0] = 0x546F1400;
+  faceD_output.length[0] = 21120;
+  faceD_output.addr[1] = 0x546F6800;
+  faceD_output.length[1] = 5280;
+  faceD_output.addr[2] = 0x546F8000;
+  faceD_output.length[2] = 21120;
+  faceD_output.addr[3] = 0x546FD400;
+  faceD_output.length[3] = 5280;
+  faceD_output.addr[4] = 0x546FEC00;
+  faceD_output.length[4] = 21120;
+  faceD_output.addr[5] = 0x54704000;
+  faceD_output.length[5] = 5280;
+  if (init_model_output(&faceD_output, fd_mem) == -1)
+  {
+    printf("[FaceRegistDriver] failed to init model output \n");
+  }
+ 
+  memset(&faceR_output, 0, sizeof(struct Model_Output));
+ 
+  faceR_output.addr[0] = 0x588A6400;
+  faceR_output.length[0] = 512;
+  if (init_model_output(&faceR_output, fd_mem) == -1)
+  {
+    printf("[FaceRegistDriver] failed to init model output \n");
+  }
+}
+ 
+void FaceRegistDriver::init_zmq()
+{
+  ros::param::get("/robot_id", robot_id);
+  std::string ip_self;
+  if(ros::param::get("/ip_self", ip_self))
+  {
+    ip_self.append("5555");
+    ROS_INFO("[FaceDetection] Local IP : %s\n", ip_self.data());
+    socket_pub.bind(ip_self);
+  }
+  else
+  {
+    ROS_WARN("[FaceDetection] Not Found Local IP !\n");
+  }
+ 
+  std::string ip_server;
+  if(ros::param::get("/ip_server", ip_server))
+  {
+    ROS_INFO("[FaceDetection] Server IP : %s\n", ip_server.data());
+    socket_sub.subscribe("face_detect");
+    socket_sub.connect(ip_server);
+  }
+  else
+  {
+    ROS_WARN("[FaceDetection] Not Found Server IP !\n");
+  }
+}
+ 
+void FaceRegistDriver::img_receive()
+{
+#ifdef WITH_SOFTBUS
+  while(status)
+#else
+  while(ros::ok())
+#endif
+  {
+    zmqpp::message message;
+    socket_sub.receive(message);
+    std::string topic;
+    std::string data_str;
+    message >> topic >> data_str;
+    std::vector<uint8_t> data_vec;
+    data_vec.assign(data_str.begin(), data_str.end());
+ 
+    cv::Mat img_decode;
+    img_decode = cv::imdecode(data_vec, CV_LOAD_IMAGE_COLOR);
+ 
+    buffer_mutex.lock();
+    if(img_buffer.size() < 3)
+    {
+      img_buffer.push(img_decode);
+    }
+    else
+    {
+      img_buffer.pop();
+      img_buffer.push(img_decode);
+    }
+    buffer_mutex.unlock();
+  }
+}
+ 
+void FaceRegistDriver::generate_priorbox(fd_param input)
+{
+  acc_real_size = 0;
+  std::vector<std::vector<int>> feature_maps;
+  for (int step = 0; step < input.steps.size(); step++)
+  {
+    std::vector<int> steps;
+    steps.push_back(ceil((double)input.image_size[0] / (double)input.steps[step]));
+    steps.push_back(ceil((double)input.image_size[1] / (double)input.steps[step]));
+    feature_maps.push_back(steps);
+    acc_real_size += steps[0] * steps[1] * 2;
+  }
+ 
+  anchors_.clear();
+ 
+  for (int k = 0; k < feature_maps.size(); k++)
+  {
+    for (int i = 0; i < feature_maps[k][0]; i++)
+    {
+      for (int j = 0; j < feature_maps[k][1]; j++)
+      {
+        for (int min_size = 0; min_size < 2; min_size++)
+        {
+          float s_kx = (float)input.min_sizes[k][min_size] / (float)input.image_size[1];
+          float s_ky = (float)input.min_sizes[k][min_size] / (float)input.image_size[0];
+          float dense_cx = (j + 0.5) * input.steps[k] / input.image_size[1];
+          float dense_cy = (i + 0.5) * input.steps[k] / input.image_size[0];
+          prior_box tmp_box;
+          tmp_box.cx = dense_cx;
+          tmp_box.cy = dense_cy;
+          tmp_box.s_kx = s_kx;
+          tmp_box.s_ky = s_ky;
+          anchors_.push_back(tmp_box);
+        }
+      }
+    }
+  }
+}
+ 
+void FaceRegistDriver::unquantify(int8_t *input, float *conf, float *loc, float *landms)
+{
+  int step_l = 22 * 30;
+  int step_s = 11 * 15;
+  int ic = 32;
+  int padding[3] = {28, 24, 12};
+  /* conf layer */
+  for (int i = 0; i < step_l; i++)
+  {
+    for (int j = 0; j < ic - padding[0]; j++)
+    {
+      int tmp = *(input + j);
+      *(conf++) = tmp * fd_s[0];
+    }
+    input += ic;
+  }
+  for (int i = 0; i < step_s; i++)
+  {
+    for (int j = 0; j < ic - padding[0]; j++)
+    {
+      int tmp = *(input + j);
+      *(conf++) = tmp * fd_s[1];
+    }
+    input += ic;
+  }
+ 
+  /* loc layer */
+  for (int i = 0; i < step_l; i++)
+  {
+    for (int j = 0; j < ic - padding[1]; j++)
+    {
+      int tmp = *(input + j);
+      *(loc++) = tmp * fd_s[2];
+    }
+    input += ic;
+  }
+  for (int i = 0; i < step_s; i++)
+  {
+    for (int j = 0; j < ic - padding[1]; j++)
+    {
+      int tmp = *(input + j);
+      *(loc++) = tmp * fd_s[3];
+    }
+    input += ic;
+  }
+ 
+  /* landms layer */
+  for (int i = 0; i < step_l; i++)
+  {
+    for (int j = 0; j < ic - padding[2]; j++)
+    {
+      int tmp = *(input + j);
+      *(landms++) = tmp * fd_s[4];
+    }
+    input += ic;
+  }
+  for (int i = 0; i < step_s; i++)
+  {
+    for (int j = 0; j < ic - padding[2]; j++)
+    {
+      int tmp = *(input + j);
+      *(landms++) = tmp * fd_s[5];
+    }
+    input += ic;
+  }
+}
+ 
+void FaceRegistDriver::decode_boxes(float *loc, float *conf, float *landms, float threshold, std::vector<float> var, std::vector<actual_box> &output)
+{
+  float resize = 1;
+  for (size_t iter = 0; iter < anchors_.size(); iter++)
+  {
+    float x_c = anchors_[iter].cx + loc[iter * 4] * var[0] * anchors_[iter].s_kx;
+    float y_c = anchors_[iter].cy + loc[iter * 4 + 1] * var[0] * anchors_[iter].s_ky;
+    float w = anchors_[iter].s_kx * expf(loc[iter * 4 + 2] * var[1]);
+    float h = anchors_[iter].s_ky * expf(loc[iter * 4 + 3] * var[1]);
+    /*
+    if(iter == 0)
+    {
+      printf(" # loc[0] # : %f, %f, %f, %f \n", loc[0], loc[1], loc[2], loc[3]);
+      printf(" # anchors_[0] # : %f, %f, %f, %f \n", anchors_[0].cx, anchors_[0].cy, anchors_[0].s_kx, anchors_[0].s_ky);
+      printf(" # boxes[0] # : %f, %f, %f, %f \n", x_c-w/2, y_c-h/2, x_c+w/2, y_c+h/2);
+    }
+*/
+    float score = expf(conf[iter * 2 + 1]) / (expf(conf[iter * 2]) + expf(conf[iter * 2 + 1]));
+ 
+    float pre_x_0 = anchors_[iter].cx + landms[iter * 10] * var[0] * anchors_[iter].s_kx;
+    float pre_y_0 = anchors_[iter].cy + landms[iter * 10 + 1] * var[0] * anchors_[iter].s_ky;
+    float pre_x_1 = anchors_[iter].cx + landms[iter * 10 + 2] * var[0] * anchors_[iter].s_kx;
+    float pre_y_1 = anchors_[iter].cy + landms[iter * 10 + 3] * var[0] * anchors_[iter].s_ky;
+    float pre_x_2 = anchors_[iter].cx + landms[iter * 10 + 4] * var[0] * anchors_[iter].s_kx;
+    float pre_y_2 = anchors_[iter].cy + landms[iter * 10 + 5] * var[0] * anchors_[iter].s_ky;
+    float pre_x_3 = anchors_[iter].cx + landms[iter * 10 + 6] * var[0] * anchors_[iter].s_kx;
+    float pre_y_3 = anchors_[iter].cy + landms[iter * 10 + 7] * var[0] * anchors_[iter].s_ky;
+    float pre_x_4 = anchors_[iter].cx + landms[iter * 10 + 8] * var[0] * anchors_[iter].s_kx;
+    float pre_y_4 = anchors_[iter].cy + landms[iter * 10 + 9] * var[0] * anchors_[iter].s_ky;
+ 
+    if (score <= threshold)
+    {
+      continue;
+    }
+ 
+    actual_box box;
+    box.tl_x = (x_c - w / 2) * input_cfg.image_size[1] / resize;
+    box.tl_y = (y_c - h / 2) * input_cfg.image_size[0] / resize;
+    box.br_x = box.tl_x + w * input_cfg.image_size[1] / resize;
+    box.br_y = box.tl_y + h * input_cfg.image_size[0] / resize;
+    box.score = score;
+    box.ref_px_0 = pre_x_0 * input_cfg.image_size[1] / resize;
+    box.ref_py_0 = pre_y_0 * input_cfg.image_size[0] / resize;
+    box.ref_px_1 = pre_x_1 * input_cfg.image_size[1] / resize;
+    box.ref_py_1 = pre_y_1 * input_cfg.image_size[0] / resize;
+    box.ref_px_2 = pre_x_2 * input_cfg.image_size[1] / resize;
+    box.ref_py_2 = pre_y_2 * input_cfg.image_size[0] / resize;
+    box.ref_px_3 = pre_x_3 * input_cfg.image_size[1] / resize;
+    box.ref_py_3 = pre_y_3 * input_cfg.image_size[0] / resize;
+    box.ref_px_4 = pre_x_4 * input_cfg.image_size[1] / resize;
+    box.ref_py_4 = pre_y_4 * input_cfg.image_size[0] / resize;
+    output.push_back(box);
+  }
+}
+ 
+static bool greater_comare(actual_box &b1, actual_box &b2)
+{
+  return b1.score > b2.score;
+}
+ 
+void FaceRegistDriver::sort_boxes(std::vector<actual_box> &boxes)
+{
+  sort(boxes.begin(), boxes.end(), greater_comare);
+}
+ 
+float FaceRegistDriver::fd_iou(actual_box box1, actual_box box2)
+{
+  float area_1 = (box1.br_x - box1.tl_x + 1) * (box1.br_y - box1.tl_y + 1);
+  float area_2 = (box2.br_x - box2.tl_x + 1) * (box2.br_y - box2.tl_y + 1);
+  float tl_xx = std::max(box1.tl_x, box2.tl_x);
+  float tl_yy = std::max(box1.tl_y, box2.tl_y);
+  float br_xx = std::min(box1.br_x, box2.br_x);
+  float br_yy = std::min(box1.br_y, box2.br_y);
+  float w = std::max(0.0f, br_xx - tl_xx + 1);
+  float h = std::max(0.0f, br_yy - tl_yy + 1);
+  float inter = w * h;
+  return (inter / (area_1 + area_2 - inter));
+}
+ 
+ 
+void FaceRegistDriver::nms(std::vector<actual_box> &boxes)
+{
+  std::vector<actual_box> results;
+  std::vector<actual_box>::iterator g_iter;
+  g_iter = boxes.begin();
+  while (boxes.size() > 0)
+  {
+    if (boxes[0].score < input_cfg.draw_threshold)
+      break;
+    results.push_back(boxes[0]);
+    size_t index = 1;
+    while (index < boxes.size())
+    {
+      float iou_value = fd_iou(boxes[0], boxes[index]);
+      if (iou_value > input_cfg.nms_threshold)
+        boxes.erase(boxes.begin() + index);
+      else
+        index++;
+    }
+    boxes.erase(boxes.begin());
+  }
+  boxes.swap(results);
+}
+ 
+void FaceRegistDriver::img_fpga_getting()
+{
+  size_t image_size = 10;
+  void *img_data = malloc(image_size);
+  int fpga_size = acc_real_size * 48;
+ 
+  rawImgFile tmp;
+  tmp.acc.acc_out = nullptr;
+  tmp.acc.acc_out = new int8_t[fpga_size];
+  if (!tmp.acc.acc_out)
+  {
+    ROS_ERROR("Allocation of memory Failed \n");
+    return;
+  }
+ 
+#ifdef WITH_SOFTBUS
+  while (status)
+#else
+  while (ros::ok())
+#endif
+  {
+    //    struct timeval start, end;
+    cv::Mat raw_img;
+    if(!img_buffer.empty())
+    {
+      buffer_mutex.lock();
+      raw_img = img_buffer.front();
+      img_buffer.pop();
+      buffer_mutex.unlock();
+    }
+    else {
+      usleep(30*1000);
+      continue;
+    }
+ 
+    cv::resize(raw_img, tmp.acc.image, cv::Size(input_cfg.image_size[1], input_cfg.image_size[0]));
+    cv::Mat padding;
+    cv::copyMakeBorder(tmp.acc.image, padding, 1, 0, 1, 0, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+ 
+    image_to_mem(padding.data, 0x46000000, fd_mem, 481 * 353 * 3);
+ 
+    tmp.raw_img = raw_img;
+    tmp.pad_img = padding;
+    tmp.file_name = robot_id;
+    tmp.subDir = robot_id;
+ 
+    /* TODO : start fpga */
+    void *mem_ctrl = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd_mem, 0x0400000000L);
+ 
+    int state = 0;
+    while (state != 1)
+    {
+      memcpy(&state, (char *)mem_ctrl + 124, 4);
+    }
+    state = 1;
+    memcpy((char *)mem_ctrl, &state, 4);
+    int res = -1;
+    memcpy(&res, (char *)mem_ctrl, 4);
+ 
+    state = 0;
+    memcpy((char *)mem_ctrl, &state, 4);
+    memcpy(&res, (char *)mem_ctrl, 4);
+    munmap(mem_ctrl, 4096);
+ 
+    read(tqdma_fd, img_data, image_size);
+    get_model_output(&faceD_output, tmp.acc.acc_out);
+    decode(tmp);
+  }
+ 
+  free(img_data);
+  img_data = nullptr;
+  delete[] tmp.acc.acc_out;
+  tmp.acc.acc_out = nullptr;
+}
+ 
+ 
+void FaceRegistDriver::img_fpga_processing()
+{
+  int fpga_size = acc_real_size * 48;
+  rawImgFile tmp;
+ 
+  tmp.acc.acc_out = nullptr;
+  tmp.acc.acc_out = new int8_t[fpga_size];
+  if (!tmp.acc.acc_out)
+  {
+    ROS_ERROR("Allocation of memory Failed \n");
+  }
+ 
+  while (status)
+  {
+    dataset_buffer_mutex.lock();
+    if (!dataset_buffer.empty())
+    {
+      tmp.acc.image = dataset_buffer.front().acc.image.clone();
+      memcpy(tmp.acc.acc_out, dataset_buffer.front().acc.acc_out, fpga_size * sizeof(int8_t));
+      delete[] dataset_buffer.front().acc.acc_out;
+      dataset_buffer.pop();
+      dataset_buffer_mutex.unlock();
+    }
+    else
+    {
+      dataset_buffer_mutex.unlock();
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      continue;
+    }
+ 
+    decode(tmp);
+  }
+ 
+  delete[] tmp.acc.acc_out;
+  tmp.acc.acc_out = nullptr;
+}
+ 
+void FaceRegistDriver::draw_objects(cv::Mat &img, std::vector<actual_box> &boxes, std::vector<int> &indexs)
+{
+  double font_size = 0.6;
+  int font_bold = 1;
+  int baseLine = 0;
+  for(size_t i = 0; i < boxes.size(); i++)
+  {
+    const actual_box &obj = boxes[i];
+ 
+    int x = static_cast<int>(std::max(0.0f, obj.tl_x));
+    int y = static_cast<int>(std::max(0.0f, obj.tl_y));
+    int w = (obj.br_x > input_cfg.image_size[1]) ? (input_cfg.image_size[1] - obj.tl_x - 1) : (obj.br_x - obj.tl_x);
+    int h = (obj.br_y > input_cfg.image_size[0]) ? (input_cfg.image_size[0] - obj.tl_y - 1) : (obj.br_y - obj.tl_y);
+    cv::Rect obj_rect(x, y, w, h);
+    cv::rectangle(img, obj_rect, cv::Scalar(0, 255, 0), font_bold);
+ 
+    cv::Size label_size = cv::getTextSize(std::to_string(indexs[i]), cv::FONT_HERSHEY_SIMPLEX, font_size, font_bold, &baseLine);
+    int tx = obj_rect.x;
+    int ty = obj_rect.y - label_size.height - baseLine;
+    if (ty < 0)
+      ty = 0;
+ 
+    cv::Point point;
+    point = cv::Point(tx, ty + label_size.height);
+    cv::rectangle(img, cv::Rect(cv::Point(obj_rect.x, ty), cv::Size(obj_rect.width, label_size.height + baseLine)), cv::Scalar(128, 128, 0), CV_FILLED);
+    cv::putText(img, std::to_string(indexs[i]), point, cv::FONT_HERSHEY_SIMPLEX, font_size, cv::Scalar(0, 255, 0), font_bold);
+  }
+}
+ 
+ 
+void FaceRegistDriver::decode(rawImgFile &img_acc)
+{
+  float *conf = (float *)calloc(acc_real_size * 2, sizeof(float));
+  float *loc = (float *)calloc(acc_real_size * 4, sizeof(float));
+  float *landms = (float *)calloc(acc_real_size * 10, sizeof(float));
+ 
+  unquantify(img_acc.acc.acc_out, conf, loc, landms);
+ 
+  std::vector<actual_box> raw_boxes, raw_boxes_cpy;
+  decode_boxes(loc, conf, landms, 0.02f, input_cfg.variance, raw_boxes);
+  if (!raw_boxes.empty())
+  {
+    sort_boxes(raw_boxes);
+    if (raw_boxes.size() > input_cfg.top_k)
+    {
+      raw_boxes_cpy.assign(raw_boxes.begin(), raw_boxes.begin() + input_cfg.top_k);
+      raw_boxes.swap(raw_boxes_cpy);
+    }
+    nms(raw_boxes);
+  }
+  cv::Mat img_cpy = img_acc.acc.image.clone();
+ 
+  std::vector<int> faceR_indexs;
+  for (size_t i = 0; i < raw_boxes.size(); i++)
+  {
+    faceR_indexs.push_back(-1);
+  }
+ 
+  if (!raw_boxes.empty())
+  {
+    start_face_recognize(img_acc, raw_boxes, faceR_indexs);
+  }
+  draw_objects(img_cpy, raw_boxes, faceR_indexs);
+  output_publish(raw_boxes, img_cpy);
+ 
+  free(conf);
+  free(loc);
+  free(landms);
+  conf = nullptr;
+  loc = nullptr;
+  landms = nullptr;
+}
+ 
+void FaceRegistDriver::output_publish(std::vector<actual_box> &res, const cv::Mat &img)
+{
+#ifndef WITH_IMAGE
+  for (auto iter : res)
+  {
+    if (iter.score < 0.8f)
+      continue;
+  }
+#else
+  std::vector<uint8_t> vec_data;
+  cv::imencode(".jpg", img, vec_data);
+  std::string str_data;
+  str_data.assign(vec_data.begin(), vec_data.end());
+  zmqpp::message message;
+  message << "pedestrian_detect" << str_data;
+  socket_pub.send(message);
+#endif
+}
+ 
+ 
+ 
+/**************************************************************/
+ 
+void FaceRegistDriver::test_fpga_faceR()
+{
+  int model_id = 4;
+  while (true)
+  {
+    if (ioctl(tqdma_fd, TQ_INST_LOAD, &model_id) != 0)
+    {
+      //    printf("FaceR Model Not Found. retry\n");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    else
+    {
+      break;
+    }
+  }
+ 
+  cv::Mat empt_mat;
+  std::vector<actual_box> empt_boxes;
+  std::vector<int> faceR_indexs;
+  while (status)
+  {
+    //start_face_recognize(empt_mat, empt_boxes, faceR_indexs);
+  }
+}
+ 
+void mysubstr(const char *src, const char *check, char *dest)
+{
+  char *strp = const_cast<char *>(strstr(src, check));
+  if(strp == nullptr)
+  {
+    return ;
+  }
+  strcpy(dest, strp + strlen(check));
+}
+ 
+void FaceRegistDriver::start_face_recognize(rawImgFile &rawimage, std::vector<actual_box> &boxes, std::vector<int> &res_indexs)
+{
+  if (!status)
+  {
+    return;
+  }
+  size_t image_size = 10;
+  void *img_data = malloc(image_size);
+ 
+  int model_id = 4;
+  while (true)
+  {
+    if (ioctl(tqdma_fd, TQ_INST_LOAD, &model_id) != 0)
+    {
+    }
+    else
+    {
+      break;
+    }
+  }
+  std::vector<cv::Mat> faces_array;
+  for (size_t i = 0; i < boxes.size(); i++)
+  {
+    float tmp[5][2] = {{boxes[i].ref_px_0, boxes[i].ref_py_0},
+                       {boxes[i].ref_px_1, boxes[i].ref_py_1},
+                       {boxes[i].ref_px_2, boxes[i].ref_py_2},
+                       {boxes[i].ref_px_3, boxes[i].ref_py_3},
+                       {boxes[i].ref_px_4, boxes[i].ref_py_4}};
+    cv::Mat tf_mat(2, 3, CV_32FC1);
+    tf_mat = get_similarity_transformMatrix(tmp);
+    cv::Mat warp_dst;
+    cv::warpAffine(rawimage.acc.image, warp_dst, tf_mat, cv::Size(128, 128));
+    cv::Mat padding;
+    cv::copyMakeBorder(warp_dst, padding, 1, 1, 1, 1, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    faces_array.push_back(padding);
+ 
+  }
+ 
+  int8_t *acc_out = (int8_t *)calloc(512, sizeof(int8_t));
+  float *out = (float *)calloc(512, sizeof(float));
+  for (size_t iter = 0; iter < faces_array.size(); iter++)
+  {
+    image_to_mem(faces_array[iter].data, 0x64000000, fd_mem, 130 * 130 * 3);
+    // TODO : start fpga
+    void *mem_ctrl = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd_mem, 0x0400000000L);
+ 
+    int state = 0;
+    while (state != 1)
+    {
+      memcpy(&state, (char *)mem_ctrl + 124, 4);
+    }
+    state = 1;
+    memcpy((char *)mem_ctrl, &state, 4);
+    int res = -1;
+    memcpy(&res, (char *)mem_ctrl, 4);
+ 
+    state = 0;
+    memcpy((char *)mem_ctrl, &state, 4);
+    memcpy(&res, (char *)mem_ctrl, 4);
+    munmap(mem_ctrl, 4096);
+ 
+    read(tqdma_fd, img_data, image_size);
+    get_model_output(&faceR_output, acc_out);
+    unquantify_norm(acc_out, out);
+ 
+#ifndef DETECTION
+ 
+    std::cout << "start_face_recognize-->dataset_dir_ : " << dataset_dir_ << std::endl;
+    std::string chr = "register/";
+    char dest[20] = {0};
+    mysubstr(const_cast<char *>(dataset_dir_.c_str()), const_cast<char *>(chr.c_str()), dest);
+    std::cout << "dest :" << dest << std::endl;
+    std::string  classDir = dest;
+ 
+    std::string pathFd =  (pkg_path + "/test_faces/embedding/" + classDir + rawimage.file_name.substr(0,rawimage.file_name.length()-3) + "jpg");
+    cv::imwrite(pathFd, faces_array[iter]);
+ 
+ 
+    FILE *fp = fopen((pkg_path + "/test_faces/embedding/" + classDir + rawimage.subDir.substr(0,rawimage.subDir.length()-1) + ".bin").c_str(), "wb");
+    fwrite(out, sizeof(float), 512, fp);
+    fclose(fp);
+ 
+#else
+    int index = match_face_vector(out);
+    res_indexs[iter] = index;
+#endif
+  }
+  free(acc_out);
+  free(out);
+  acc_out = nullptr;
+  out = nullptr;
+ 
+  go_out = false;
+  free(img_data);
+  img_data = nullptr;
+ 
+  restart_faceD_acc();
+}
+ 
+cv::Mat FaceRegistDriver::mean_axis0(const cv::Mat &src)
+{
+  int num = src.rows;
+  int dim = src.cols;
+  cv::Mat output(1, dim, CV_32F);
+  for (int i = 0; i < dim; i++)
+  {
+    float sum = 0;
+    for (int j = 0; j < num; j++)
+    {
+      sum += src.at<float>(j, i);
+    }
+    output.at<float>(0, i) = sum / num;
+  }
+  return output;
+}
+ 
+cv::Mat FaceRegistDriver::element_wise_minus(const cv::Mat &A, const cv::Mat &B)
+{
+  cv::Mat output(A.rows, A.cols, A.type());
+  assert(B.cols == A.cols);
+  if (B.cols == A.cols)
+  {
+    for (int i = 0; i < A.rows; i++)
+    {
+      for (int j = 0; j < B.cols; j++)
+      {
+        output.at<float>(i, j) = A.at<float>(i, j) - B.at<float>(0, j);
+      }
+    }
+  }
+  return output;
+}
+ 
+cv::Mat FaceRegistDriver::var_axis0(const cv::Mat &src)
+{
+  cv::Mat temp_ = element_wise_minus(src, mean_axis0(src));
+  cv::multiply(temp_, temp_, temp_);
+  return mean_axis0(temp_);
+}
+ 
+int FaceRegistDriver::matrix_rank(cv::Mat M)
+{
+  cv::Mat w, u, vt;
+  cv::SVD::compute(M, w, u, vt);
+  cv::Mat1b nonZeroSingularValues = w > 0.0001;
+  std::cout << "nonZeroSingularValues : " << nonZeroSingularValues << std::endl;
+  int rank = cv::countNonZero(nonZeroSingularValues);
+  return rank;
+}
+ 
+cv::Mat FaceRegistDriver::similar_transform(cv::Mat src, cv::Mat dst)
+{
+  std::cout << "src : " << src << std::endl;
+  int num = src.rows; // height = 5
+  int dim = src.cols; // width = 2
+  cv::Mat src_mean = mean_axis0(src);
+  cv::Mat dst_mean = mean_axis0(dst);
+  std::cout << "src_mean : " << src_mean << std::endl;
+ 
+  cv::Mat src_demean = element_wise_minus(src, src_mean);
+  std::cout << "src_demean : " << src_demean << std::endl;
+  cv::Mat dst_demean = element_wise_minus(dst, dst_mean);
+ 
+  cv::Mat A = (dst_demean.t() * src_demean) / static_cast<float>(num);
+  std::cout << "A : " << A << std::endl;
+ 
+  cv::Mat d(dim, 1, CV_32F);
+  d.setTo(1.0f);
+  if (cv::determinant(A) < 0)
+  {
+    d.at<float>(dim - 1, 0) = -1;
+  }
+  std::cout << "d : " << d << std::endl;
+ 
+  cv::Mat T = cv::Mat::eye(dim + 1, dim + 1, CV_32F);
+  std::cout << "o_T : " << T << std::endl;
+  cv::Mat U, S, V;
+  cv::SVD::compute(A, S, U, V);
+  std::cout << "S : " << S << std::endl;
+ 
+  int rank = matrix_rank(A);
+  std::cout << "rank : " << rank << std::endl;
+  if (rank == 0)
+  {
+    assert(rank == 0);
+  }
+  else if (rank = dim - 1)
+  {
+    if (cv::determinant(U) * cv::determinant(V) > 0)
+    {
+      T.rowRange(0, dim).colRange(0, dim) = U * V;
+    }
+    else
+    {
+      int s = d.at<float>(dim - 1, 0);
+      d.at<float>(dim - 1, 0) = -1;
+      T.rowRange(0, dim).colRange(0, dim) = U * V;
+      cv::Mat diag_ = cv::Mat::diag(d);
+      cv::Mat twp = diag_ * V;
+      cv::Mat B = cv::Mat::zeros(3, 3, CV_8UC1);
+      cv::Mat C = B.diag(0);
+      T.rowRange(0, dim).colRange(0, dim) = U * twp;
+      d.at<float>(dim - 1, 0) = s;
+    }
+  }
+  else
+  {
+    cv::Mat diag_ = cv::Mat::diag(d);
+    cv::Mat twp = diag_ * V.t();
+    cv::Mat res = U * twp;
+    T.rowRange(0, dim).colRange(0, dim) = -U.t() * twp;
+  }
+ 
+  std::cout << "rank_T : " << T << std::endl;
+  cv::Mat var_ = var_axis0(src_demean);
+  std::cout << "var_ : " << var_ << std::endl;
+  float val = cv::sum(var_).val[0];
+  std::cout << "val : " << val << std::endl;
+  cv::Mat res;
+  cv::multiply(d, S, res);
+  float scale = 1.0 / val * cv::sum(res).val[0];
+  std::cout << "scale : " << scale << std::endl;
+  T.rowRange(0, dim).colRange(0, dim) = -T.rowRange(0, dim).colRange(0, dim).t();
+  cv::Mat temp1 = T.rowRange(0, dim).colRange(0, dim);
+  cv::Mat temp2 = src_mean.t();
+  cv::Mat temp3 = temp1 * temp2;
+  cv::Mat temp4 = scale * temp3;
+  T.rowRange(0, dim).colRange(dim, dim + 1) = -(temp4 - dst_mean.t());
+  std::cout << "no *scale T : " << T << std::endl;
+  T.rowRange(0, dim).colRange(0, dim) *= scale;
+  return T;
+}
+ 
+cv::Mat FaceRegistDriver::get_similarity_transformMatrix(float src[5][2])
+{
+  float avg_x = (src[0][0] + src[1][0] + src[2][0] + src[3][0] + src[4][0]) / 5;
+  float avg_y = (src[0][1] + src[1][1] + src[2][1] + src[3][1] + src[4][1]) / 5;
+ 
+  //Compute mean of src and dst.
+  float src_mean[2] = {avg_x, avg_y};
+ 
+  //Subtract mean from src and dst.
+  float src_demean[5][2];
+  for (int i = 0; i < 2; i++)
+  {
+    for (int j = 0; j < 5; j++)
+    {
+      src_demean[j][i] = src[j][i] - src_mean[i];
+    }
+  }
+  float dst_demean[5][2];
+  for (int i = 0; i < 2; i++)
+  {
+    for (int j = 0; j < 5; j++)
+    {
+      dst_demean[j][i] = face_benchmark[j][i] - face_benchmark_mean[i];
+    }
+  }
+ 
+  double A00 = 0.0, A01 = 0.0, A10 = 0.0, A11 = 0.0;
+  for (int i = 0; i < 5; i++)
+    A00 += dst_demean[i][0] * src_demean[i][0];
+  A00 = A00 / 5;
+  for (int i = 0; i < 5; i++)
+    A01 += dst_demean[i][0] * src_demean[i][1];
+  A01 = A01 / 5;
+  for (int i = 0; i < 5; i++)
+    A10 += dst_demean[i][1] * src_demean[i][0];
+  A10 = A10 / 5;
+  for (int i = 0; i < 5; i++)
+    A11 += dst_demean[i][1] * src_demean[i][1];
+  A11 = A11 / 5;
+  cv::Mat A = (cv::Mat_<double>(2, 2) << A00, A01, A10, A11);
+ 
+  double d[2] = {1.0, 1.0};
+  double detA = A00 * A11 - A01 * A10;
+  if (detA < 0)
+    d[1] = -1;
+  double T[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
+  //Singular Value Decomposition
+  cv::Mat s, u, vt, v;
+  cv::SVD::compute(A, s, u, vt);
+  cv::Mat S(s.rows, s.rows, s.type());
+  for (int i = 0; i < 2; i++)
+    S.ptr<double>(i)[i] = s.ptr<double>(i)[0];
+  cv::Mat svd = u * S * vt;
+  double smax = s.ptr<double>(0)[0] > s.ptr<double>(1)[0] ? s.ptr<double>(0)[0] : s.ptr<double>(1)[0];
+  double tol = smax * 2 * FLT_MIN;
+  int rank = 0;
+  if (s.ptr<double>(0)[0] > tol)
+    rank += 1;
+  if (s.ptr<double>(1)[0] > tol)
+    rank += 1;
+  double arr_u[2][2] = {u.ptr<double>(0)[0], u.ptr<double>(0)[1], u.ptr<double>(1)[0], u.ptr<double>(1)[1]};
+  double arr_vt[2][2] = {vt.ptr<double>(0)[0], vt.ptr<double>(0)[1], vt.ptr<double>(1)[0], vt.ptr<double>(1)[1]};
+  double det_u = arr_u[0][0] * arr_u[1][1] - arr_u[0][1] * arr_u[1][0];
+  double det_vt = arr_vt[0][0] * arr_vt[1][1] - arr_vt[0][1] * arr_vt[1][0];
+  if (rank == 1)
+  {
+    if ((det_u * det_vt) > 0)
+    {
+      cv::Mat uvt = u * vt;
+      T[0][0] = uvt.ptr<double>(0)[0];
+      T[0][1] = uvt.ptr<double>(0)[1];
+      T[1][0] = uvt.ptr<double>(1)[0];
+      T[1][1] = uvt.ptr<double>(1)[1];
+    }
+    else
+    {
+      double temp = d[1];
+      d[1] = -1;
+      cv::Mat D = (cv::Mat_<double>(2, 2) << d[0], 0.0, 0.0, d[1]);
+      cv::Mat Dvt = D * vt;
+      cv::Mat uDvt = u * Dvt;
+      T[0][0] = uDvt.ptr<double>(0)[0];
+      T[0][1] = uDvt.ptr<double>(0)[1];
+      T[1][0] = uDvt.ptr<double>(1)[0];
+      T[1][1] = uDvt.ptr<double>(1)[1];
+      d[1] = temp;
+    }
+  }
+  else
+  {
+    cv::Mat D = (cv::Mat_<double>(2, 2) << d[0], 0.0, 0.0, d[1]);
+    cv::Mat Dvt = D * vt;
+    cv::Mat uDvt = u * Dvt;
+    T[0][0] = uDvt.ptr<double>(0)[0];
+    T[0][1] = uDvt.ptr<double>(0)[1];
+    T[1][0] = uDvt.ptr<double>(1)[0];
+    T[1][1] = uDvt.ptr<double>(1)[1];
+  }
+  double var1 = 0.0;
+  for (int i = 0; i < 5; i++)
+    var1 += src_demean[i][0] * src_demean[i][0];
+  var1 = var1 / 5;
+  double var2 = 0.0;
+  for (int i = 0; i < 5; i++)
+    var2 += src_demean[i][1] * src_demean[i][1];
+  var2 = var2 / 5;
+  double scale = 1.0 / (var1 + var2) * (s.ptr<double>(0)[0] * d[0] + s.ptr<double>(1)[0] * d[1]);
+  double TS[2];
+  TS[0] = T[0][0] * src_mean[0] + T[0][1] * src_mean[1];
+  TS[1] = T[1][0] * src_mean[0] + T[1][1] * src_mean[1];
+  //T[:dim, dim] = dst_mean - scale * np.dot(T[:dim, :dim], src_mean.T)
+  T[0][2] = face_benchmark_mean[0] - scale * TS[0];
+  T[1][2] = face_benchmark_mean[1] - scale * TS[1];
+  T[0][0] *= scale;
+  T[0][1] *= scale;
+  T[1][0] *= scale;
+  T[1][1] *= scale;
+  cv::Mat transform_mat = (cv::Mat_<double>(2, 3) << T[0][0], T[0][1], T[0][2], T[1][0], T[1][1], T[1][2]);
+  return transform_mat;
+}
+ 
+void FaceRegistDriver::unquantify_norm(int8_t *input, float *output)
+{
+  float scale = 0.07461532f;
+  float sum = 0.0f;
+  for (int i = 0; i < 512; i++)
+  {
+    *(output + i) = (*(input + i)) * scale;
+    sum += powf(*(output + i), 2);
+  }
+  float arv = sqrtf(sum);
+  for (int j = 0; j < 512; j++)
+  {
+    *(output + j) = *(output + j) / arv;
+  }
+}
+ 
+void FaceRegistDriver::unquantify_norm(int8_t *input, int8_t *input_mirror, float *output)
+{
+  float scale = 0.07461532f;
+  float sum = 0.0f;
+  for (int i = 0; i < 512; i++)
+  {
+    *(output + i) = ((*(input + i)) + (*(input_mirror + i))) * scale;
+    sum += powf(*(output + i), 2);
+  }
+  float arv = sqrtf(sum);
+  for (int j = 0; j < 512; j++)
+  {
+    *(output + j) = *(output + j) / arv;
+  }
+}
+ 
+int FaceRegistDriver::match_face_vector(float *src_emb)
+{
+  int index = -1;
+  float min_dist = 0.0f;
+  for (size_t iter = 0; iter < target_embs.size(); iter++)
+  {
+    float sum = 0.0f;
+    for (int i = 0; i < 512; i++)
+    {
+      sum += powf(*(src_emb + i) - *(target_embs[iter] + i), 2);
+    }
+    if (iter == 0)
+    {
+      index = iter;
+      min_dist = sum;
+    }
+    else
+    {
+      if (sum < min_dist)
+      {
+        index = iter;
+        min_dist = sum;
+      }
+    }
+  }
+  if (min_dist > dist_threshold)
+    index = -1;
+  return index;
+}
+ 
+void FaceRegistDriver::test_face_correction()
+{
+  //  std::string pkg_path = ros::package::getPath("face_detection");
+  std::string dets_file = pkg_path + "/data/480_352/dets_afterNMS.bin";
+  cv::Mat raw_img = cv::imread(pkg_path + "/data/480_352/face.jpg");
+  FILE *dets_fp = fopen(dets_file.c_str(), "rb");
+  float *dets = (float *)calloc(675 * 4, sizeof(float));
+  fread(dets, sizeof(float), 675 * 4, dets_fp);
+ 
+  float detect[5][2] = {
+    {252.17828f, 206.55666f},
+    {264.6776f, 207.54399f},
+    {258.94333f, 214.21661f},
+    {252.65053f, 220.9549f},
+    {262.19107f, 221.76419f}};
+ 
+  /*
+  cv::Mat src(5, 2, CV_32FC1, anchors);
+  memcpy(src.data, anchors, 2 * 5 * sizeof(float));
+  cv::Mat dst(5, 2, CV_32FC1, detect);
+  memcpy(dst.data, detect, 2 * 5 * sizeof(float));
+  cv::Mat M = similar_transform(src, dst);  // skimage.transform.SimilarityTransform
+  cv::Mat warpImg;
+  std::cout << M << std::endl;
+  cv::Point2f cv_anchors[3] = {cv::Point2f(30.2946f+8.0f, 51.6963f), cv::Point2f(65.5318f+8.0f, 51.5014f), cv::Point2f(48.0252f+8.0f, 71.7366f)};
+  cv::Point2f cv_det[3] = {cv::Point2f(53.3183f, 266.407f), cv::Point2f(64.3610f, 265.452f), cv::Point2f(59.7155f, 272.543f)};
+  cv::Mat M_cv = cv::getAffineTransform(cv_det, cv_anchors);
+  cv::Mat M_r(2, 3, CV_32FC1);
+  M.rowRange(0, 2).copyTo(M_r.rowRange(0, 2));
+  std::cout << "M_cv : " << M_cv << std::endl;
+  cv::warpAffine(raw_img, warpImg, M_r, cv::Size(112, 112));
+  //  cv::warpPerspective(raw_img, warpImg, M, cv::Size(112, 112));
+  cv::imshow("correct_face", warpImg);
+  cv::waitKey(0);
+  */
+ 
+  cv::Mat tf_mat(2, 3, CV_32FC1);
+  tf_mat = get_similarity_transformMatrix(detect);
+  cv::Mat warp_dst; // = cv::Mat::zeros(112, 112, raw_img.type());
+  warpAffine(raw_img, warp_dst, tf_mat, cv::Size(112, 112));
+  cv::imshow("rect_face", warp_dst);
+  cv::waitKey(0);
+}
+ 
+void FaceRegistDriver::test_face_recognize()
+{
+  std::string acc_file = pkg_path + "/data/acc_fr/output8b.bin";
+  //  std::string acc_file = pkg_path + "/data/acc_fr/0.bin";
+  FILE *acc_fp = fopen(acc_file.c_str(), "rb");
+  int8_t *acc_out = (int8_t *)calloc(512, sizeof(int8_t));
+  fread(acc_out, sizeof(float), 512, acc_fp);
+ 
+  float *out = (float *)calloc(512, sizeof(float));
+  unquantify_norm(acc_out, out);
+  int index = match_face_vector(out);
+  std::cout << "face index : " << index << std::endl;
+}
