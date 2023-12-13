@@ -1,0 +1,69 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+int main() {
+    // 加载人脸级联分类器
+    cv::CascadeClassifier face_cascade;
+    if (!face_cascade.load("haarcascade_frontalface_alt.xml")) {
+        std::cerr << "Error loading face cascade." << std::endl;
+        return -1;
+    }
+
+    // 创建LBPH人脸识别器
+    cv::Ptr<cv::face::LBPHFaceRecognizer> recognizer = cv::face::LBPHFaceRecognizer::create();
+
+    // 加载训练好的人脸识别器模型
+    recognizer->read("lbph_model.xml");
+
+    // 打开摄像头
+    cv::VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        std::cerr << "Error opening camera." << std::endl;
+        return -1;
+    }
+
+    cv::Mat frame;
+    while (cap.read(frame)) {
+        // 转换为灰度图
+        cv::Mat gray;
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        // 检测人脸
+        std::vector<cv::Rect> faces;
+        face_cascade.detectMultiScale(gray, faces, 1.1, 4);
+
+        // 遍历检测到的人脸
+        for (const auto& face : faces) {
+            cv::Mat face_roi = gray(face);
+
+            // 进行人脸识别
+            int label;
+            double confidence;
+            recognizer->predict(face_roi, label, confidence);
+
+            // 标记人脸位置
+            cv::rectangle(frame, face, cv::Scalar(255, 0, 0), 2);
+
+            // 显示标签和置信度
+            std::string label_str = "Person: " + std::to_string(label);
+            std::string confidence_str = "Confidence: " + std::to_string(confidence);
+            cv::putText(frame, label_str, cv::Point(face.x, face.y - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+            cv::putText(frame, confidence_str, cv::Point(face.x, face.y + face.height + 15), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 2);
+        }
+
+        // 显示结果
+        cv::imshow("Face Recognition", frame);
+
+        // 退出条件
+        if (cv::waitKey(30) == 27) {
+            break;
+        }
+    }
+
+    // 释放摄像头和窗口
+    cap.release();
+    cv::destroyAllWindows();
+
+    return 0;
+}
